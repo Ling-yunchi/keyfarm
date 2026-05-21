@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { FarmCanvas, CANVAS_WIDTH, CANVAS_HEIGHT } from './components/FarmCanvas';
 import { StatsPanel } from './components/StatsPanel';
 import { useGameState } from './hooks/useGameState';
@@ -34,10 +34,7 @@ function App() {
   const [showStats, setShowStats] = useState(false);
   const [viewMode, setViewMode] = useState<'farm' | 'heatmap'>('farm');
   const [isoFlipped, setIsoFlipped] = useState(false);
-  const [isDragging, setIsDragging] = useState(false);
   const [permissionGranted, setPermissionGranted] = useState<boolean | null>(null);
-
-  const resizeTimerRef = useRef<number>(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -65,27 +62,17 @@ function App() {
   }, []);
 
   useEffect(() => {
-    let mounted = false;
     const updateScale = () => {
       const s = Math.min(
         window.innerWidth / CANVAS_WIDTH,
         window.innerHeight / CANVAS_HEIGHT,
       );
       setScale(s);
-
-      // Show border while resizing, hide after 300ms of no resize
-      if (mounted) {
-        setIsDragging(true);
-        clearTimeout(resizeTimerRef.current);
-        resizeTimerRef.current = window.setTimeout(() => setIsDragging(false), 300);
-      }
     };
     updateScale();
-    mounted = true;
     window.addEventListener('resize', updateScale);
     return () => {
       window.removeEventListener('resize', updateScale);
-      clearTimeout(resizeTimerRef.current);
     };
   }, []);
 
@@ -110,23 +97,6 @@ function App() {
     return () => { unlisten.then((f) => f()); };
   }, []);
 
-  useEffect(() => {
-    if (!isDragging) return;
-    const end = () => setIsDragging(false);
-    window.addEventListener('mouseup', end);
-    window.addEventListener('blur', end);
-    const timer = setTimeout(end, 5000);
-    return () => {
-      window.removeEventListener('mouseup', end);
-      window.removeEventListener('blur', end);
-      clearTimeout(timer);
-    };
-  }, [isDragging]);
-
-  const handleDragStart = useCallback(() => {
-    setIsDragging(true);
-  }, []);
-
   const handleDuckEaten = useCallback((duckId: string) => {
     const now = Date.now();
     const updatedAnimals = gameState.animals.map(a =>
@@ -138,20 +108,19 @@ function App() {
   const handleResizeGrip = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    setIsDragging(true);
-    getCurrentWindow().startResizeDragging('BottomRight' as never);
+    getCurrentWindow().startResizeDragging('SouthEast');
   }, []);
 
   if (permissionGranted === null) return null;
   if (!permissionGranted) return <PermissionScreen />;
 
   return (
-    <div className={`app-container${isDragging ? ' is-dragging' : ''}`}>
+    <div className="app-container">
       <div
         className="canvas-scaler"
         style={{ transform: `scale(${scale})` }}
       >
-        <FarmCanvas gameState={gameState} animations={animations} onHarvest={harvest} onRemovePest={removePest} onFertilize={fertilize} onDuckEaten={handleDuckEaten} onDuckAttacked={duckAttacked} onWaterToFish={waterToFish} onDogScared={dogScared} onDragStart={handleDragStart} viewMode={viewMode} flipX={isoFlipped} />
+        <FarmCanvas gameState={gameState} animations={animations} onHarvest={harvest} onRemovePest={removePest} onFertilize={fertilize} onDuckEaten={handleDuckEaten} onDuckAttacked={duckAttacked} onWaterToFish={waterToFish} onDogScared={dogScared} viewMode={viewMode} flipX={isoFlipped} />
       </div>
       {showStats && (
         <StatsPanel gameState={gameState} onClose={() => setShowStats(false)} onHireWorker={hireWorker} onUpgradeSpeed={upgradeWorkerSpeed} />

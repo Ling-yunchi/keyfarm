@@ -1,10 +1,11 @@
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(target_os = "windows"))]
 use std::sync::Arc;
-use tauri::Emitter;
-use tauri::Manager;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::Emitter;
+use tauri::Manager;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 
 struct TrayMenuItems {
@@ -304,12 +305,7 @@ mod win_keyboard {
             hmod: HINSTANCE,
             dw_thread_id: u32,
         ) -> HHOOK;
-        fn CallNextHookEx(
-            hhk: HHOOK,
-            n_code: i32,
-            w_param: WPARAM,
-            l_param: LPARAM,
-        ) -> LRESULT;
+        fn CallNextHookEx(hhk: HHOOK, n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT;
         fn GetMessageW(
             lp_msg: *mut MSG,
             h_wnd: HWND,
@@ -398,6 +394,247 @@ mod win_keyboard {
 }
 
 // =============================================================================
+// Windows desktop-layer host (Rainmeter-style Z-order placement)
+// =============================================================================
+
+#[cfg(target_os = "windows")]
+mod win_desktop_host {
+    use super::WindowPinned;
+    use std::ffi::c_void;
+    use std::ptr;
+    use std::sync::atomic::Ordering;
+    use std::thread;
+    use std::time::Duration;
+    use tauri::Manager;
+
+    type HWND = *mut c_void;
+    type HMODULE = *mut c_void;
+    type LPCWSTR = *const u16;
+
+    const GWL_EXSTYLE: i32 = -20;
+    const GA_PARENT: u32 = 1;
+    const GW_HWNDPREV: u32 = 3;
+    const WS_EX_TOPMOST: isize = 0x00000008;
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOMOVE: u32 = 0x0002;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    const SWP_NOOWNERZORDER: u32 = 0x0200;
+    const SWP_NOSENDCHANGING: u32 = 0x0400;
+    const ZPOS_FLAGS: u32 =
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING;
+    const HWND_TOPMOST: HWND = -1isize as HWND;
+    const HWND_NOTOPMOST: HWND = -2isize as HWND;
+    const HWND_BOTTOM: HWND = 1isize as HWND;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn FindWindowW(lp_class_name: LPCWSTR, lp_window_name: LPCWSTR) -> HWND;
+        fn FindWindowExW(
+            hwnd_parent: HWND,
+            hwnd_child_after: HWND,
+            lpsz_class: LPCWSTR,
+            lpsz_window: LPCWSTR,
+        ) -> HWND;
+        fn GetAncestor(hwnd: HWND, ga_flags: u32) -> HWND;
+        fn GetClassNameW(hwnd: HWND, lp_class_name: *mut u16, n_max_count: i32) -> i32;
+        fn GetModuleHandleW(lp_module_name: LPCWSTR) -> HMODULE;
+        fn GetWindow(hwnd: HWND, u_cmd: u32) -> HWND;
+        fn GetProcAddress(h_module: HMODULE, lp_proc_name: *const u8) -> *mut c_void;
+        fn GetWindowLongPtrW(hwnd: HWND, n_index: i32) -> isize;
+        fn GetWindowThreadProcessId(hwnd: HWND, lpdw_process_id: *mut u32) -> u32;
+        fn IsWindow(hwnd: HWND) -> i32;
+        fn IsWindowVisible(hwnd: HWND) -> i32;
+        fn SetWindowPos(
+            hwnd: HWND,
+            hwnd_insert_after: HWND,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            flags: u32,
+        ) -> i32;
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    unsafe fn get_class_name(hwnd: HWND) -> Option<String> {
+        let mut buffer = [0u16; 64];
+        let len = GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+        if len <= 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buffer[..len as usize]))
+    }
+
+    unsafe fn is_class(hwnd: HWND, class_name: &str) -> bool {
+        get_class_name(hwnd).as_deref() == Some(class_name)
+    }
+
+    unsafe fn same_process(a: HWND, b: HWND) -> bool {
+        let mut a_pid = 0;
+        let mut b_pid = 0;
+        GetWindowThreadProcessId(a, &mut a_pid);
+        GetWindowThreadProcessId(b, &mut b_pid);
+        a_pid != 0 && a_pid == b_pid
+    }
+
+    unsafe fn has_current_monitor_topology_id() -> bool {
+        let user32 = wide("user32");
+        let module = GetModuleHandleW(user32.as_ptr());
+        !module.is_null()
+            && !GetProcAddress(module, b"GetCurrentMonitorTopologyId\0".as_ptr()).is_null()
+    }
+
+    unsafe fn default_shell_window() -> HWND {
+        let progman = wide("Progman");
+        let shell = FindWindowW(progman.as_ptr(), ptr::null());
+        if shell.is_null() || !is_class(shell, "Progman") {
+            ptr::null_mut()
+        } else {
+            shell
+        }
+    }
+
+    unsafe fn desktop_icons_host_window() -> HWND {
+        let shell = default_shell_window();
+        if shell.is_null() {
+            return ptr::null_mut();
+        }
+
+        let def_view = wide("SHELLDLL_DefView");
+        let worker_w = wide("WorkerW");
+
+        // Rainmeter uses Progman directly on Windows 11 24H2+, where the shell
+        // hierarchy changed and SHELLDLL_DefView is under Progman.
+        if has_current_monitor_topology_id() {
+            if !FindWindowExW(shell, ptr::null_mut(), def_view.as_ptr(), ptr::null()).is_null() {
+                return shell;
+            }
+            return ptr::null_mut();
+        }
+
+        let shell_def_view = FindWindowExW(shell, ptr::null_mut(), def_view.as_ptr(), ptr::null());
+        if !shell_def_view.is_null() {
+            let parent = GetAncestor(shell_def_view, GA_PARENT);
+            if !parent.is_null() && parent != shell && is_class(parent, "WorkerW") {
+                return parent;
+            }
+        }
+
+        let mut worker = ptr::null_mut();
+        loop {
+            worker = FindWindowExW(ptr::null_mut(), worker, worker_w.as_ptr(), ptr::null());
+            if worker.is_null() {
+                break;
+            }
+
+            if IsWindowVisible(worker) != 0
+                && same_process(shell, worker)
+                && !FindWindowExW(worker, ptr::null_mut(), def_view.as_ptr(), ptr::null()).is_null()
+            {
+                return worker;
+            }
+        }
+
+        ptr::null_mut()
+    }
+
+    unsafe fn position_after_desktop_topmost(hwnd: HWND, desktop_host: HWND) -> bool {
+        let mut insert_after = desktop_host;
+        loop {
+            insert_after = GetWindow(insert_after, GW_HWNDPREV);
+            if insert_after.is_null() {
+                break;
+            }
+
+            if GetWindowLongPtrW(insert_after, GWL_EXSTYLE) & WS_EX_TOPMOST != 0
+                && SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, ZPOS_FLAGS) != 0
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn apply_window(hwnd: HWND) -> bool {
+        if hwnd.is_null() {
+            return false;
+        }
+
+        unsafe {
+            if IsWindow(hwnd) == 0 {
+                return false;
+            }
+
+            let desktop_host = desktop_icons_host_window();
+            if desktop_host.is_null() {
+                SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, ZPOS_FLAGS) != 0
+            } else if position_after_desktop_topmost(hwnd, desktop_host) {
+                true
+            } else {
+                SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, ZPOS_FLAGS) != 0
+            }
+        }
+    }
+
+    fn set_topmost_window(hwnd: HWND, topmost: bool) -> bool {
+        if hwnd.is_null() {
+            return false;
+        }
+
+        unsafe {
+            if IsWindow(hwnd) == 0 {
+                return false;
+            }
+
+            let insert_after = if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST };
+            SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, ZPOS_FLAGS) != 0
+        }
+    }
+
+    pub fn apply(app: &tauri::AppHandle) -> bool {
+        if app.state::<WindowPinned>().0.load(Ordering::SeqCst) {
+            return false;
+        }
+
+        let Some(window) = app.get_webview_window("main") else {
+            return false;
+        };
+
+        match window.hwnd() {
+            Ok(hwnd) => apply_window(hwnd.0 as HWND),
+            Err(_) => false,
+        }
+    }
+
+    pub fn set_topmost(app: &tauri::AppHandle, topmost: bool) -> bool {
+        let Some(window) = app.get_webview_window("main") else {
+            return false;
+        };
+
+        match window.hwnd() {
+            Ok(hwnd) => set_topmost_window(hwnd.0 as HWND, topmost),
+            Err(_) => false,
+        }
+    }
+
+    pub fn schedule_apply(app: &tauri::AppHandle, delay: Duration) {
+        let app = app.clone();
+        thread::spawn(move || {
+            thread::sleep(delay);
+            let app_for_task = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                apply(&app_for_task);
+            });
+        });
+    }
+
+}
+
+// =============================================================================
 // Accessibility permission check (macOS)
 // =============================================================================
 
@@ -457,6 +694,10 @@ fn toggle_window(app: &tauri::AppHandle) {
         } else {
             let _ = window.show();
             let _ = window.set_focus();
+            #[cfg(target_os = "windows")]
+            if !app.state::<WindowPinned>().0.load(Ordering::SeqCst) {
+                win_desktop_host::schedule_apply(app, std::time::Duration::from_millis(80));
+            }
         }
     }
 }
@@ -465,15 +706,24 @@ fn update_tray_menu_labels(app: &tauri::AppHandle) {
     let visible = app.state::<WindowVisible>().0.load(Ordering::SeqCst);
     let pinned = app.state::<WindowPinned>().0.load(Ordering::SeqCst);
     let items = app.state::<TrayMenuItems>();
-    let _ = items.show.set_text(if visible { "Hide Window" } else { "Show Window" });
-    let _ = items.pin.set_text(if pinned { "Unpin from Top" } else { "Pin to Top" });
+    let _ = items.show.set_text(if visible {
+        "Hide Window"
+    } else {
+        "Show Window"
+    });
+    let _ = items.pin.set_text(if pinned {
+        "Unpin from Top"
+    } else {
+        "Pin to Top"
+    });
 }
 
 fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let show = MenuItem::with_id(app, "show", "Hide Window", true, None::<&str>)?;
     let pin = MenuItem::with_id(app, "pin", "Unpin from Top", true, None::<&str>)?;
     let heatmap = MenuItem::with_id(app, "heatmap", "Heatmap", true, None::<&str>)?;
-    let perspective = MenuItem::with_id(app, "perspective", "Perspective: Left", true, None::<&str>)?;
+    let perspective =
+        MenuItem::with_id(app, "perspective", "Perspective: Left", true, None::<&str>)?;
     let stats = MenuItem::with_id(app, "stats", "Stats", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &pin, &heatmap, &perspective, &stats, &quit])?;
@@ -490,49 +740,71 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     TrayIconBuilder::new()
         .icon(tauri::include_image!("icons/tray-icon.png"))
         .menu(&menu)
-        .on_menu_event(|app, event| {
-            match event.id.as_ref() {
-                "show" => {
-                    toggle_window(app);
-                    update_tray_menu_labels(app);
-                }
-                "pin" => {
-                    let pinned = app.state::<WindowPinned>();
-                    let was_pinned = pinned.0.fetch_xor(true, Ordering::SeqCst);
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.set_always_on_top(!was_pinned);
-                    }
-                    update_tray_menu_labels(app);
-                }
-                "heatmap" => {
-                    let state = app.state::<HeatmapState>();
-                    let was_on = state.0.fetch_xor(true, Ordering::Relaxed);
-                    let items = app.state::<TrayMenuItems>();
-                    let _ = items.heatmap.set_text(if was_on { "Heatmap" } else { "Heatmap \u{2705}" });
-                    let _ = app.emit("toggle-heatmap", ());
-                }
-                "perspective" => {
-                    let state = app.state::<PerspectiveState>();
-                    let was_on = state.0.fetch_xor(true, Ordering::Relaxed);
-                    let items = app.state::<TrayMenuItems>();
-                    let _ = items.perspective.set_text(if was_on { "Perspective: Left" } else { "Perspective: Right" });
-                    let _ = app.emit("toggle-perspective", ());
-                }
-                "stats" => {
-                    let visible = app.state::<WindowVisible>();
-                    if !visible.0.load(Ordering::SeqCst) {
-                        visible.0.store(true, Ordering::SeqCst);
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                        update_tray_menu_labels(app);
-                    }
-                    let _ = app.emit("toggle-stats", ());
-                }
-                "quit" => app.exit(0),
-                _ => {}
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => {
+                toggle_window(app);
+                update_tray_menu_labels(app);
             }
+            "pin" => {
+                let pinned = app.state::<WindowPinned>();
+                let was_pinned = pinned.0.fetch_xor(true, Ordering::SeqCst);
+                let now_pinned = !was_pinned;
+                #[cfg(target_os = "windows")]
+                {
+                    let _ = win_desktop_host::set_topmost(app, now_pinned);
+                    if !now_pinned {
+                        win_desktop_host::schedule_apply(app, std::time::Duration::from_millis(80));
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.set_always_on_top(now_pinned);
+                }
+                update_tray_menu_labels(app);
+            }
+            "heatmap" => {
+                let state = app.state::<HeatmapState>();
+                let was_on = state.0.fetch_xor(true, Ordering::Relaxed);
+                let items = app.state::<TrayMenuItems>();
+                let _ = items.heatmap.set_text(if was_on {
+                    "Heatmap"
+                } else {
+                    "Heatmap \u{2705}"
+                });
+                let _ = app.emit("toggle-heatmap", ());
+            }
+            "perspective" => {
+                let state = app.state::<PerspectiveState>();
+                let was_on = state.0.fetch_xor(true, Ordering::Relaxed);
+                let items = app.state::<TrayMenuItems>();
+                let _ = items.perspective.set_text(if was_on {
+                    "Perspective: Left"
+                } else {
+                    "Perspective: Right"
+                });
+                let _ = app.emit("toggle-perspective", ());
+            }
+            "stats" => {
+                let visible = app.state::<WindowVisible>();
+                if !visible.0.load(Ordering::SeqCst) {
+                    visible.0.store(true, Ordering::SeqCst);
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                        #[cfg(target_os = "windows")]
+                        if !app.state::<WindowPinned>().0.load(Ordering::SeqCst) {
+                            win_desktop_host::schedule_apply(
+                                app,
+                                std::time::Duration::from_millis(80),
+                            );
+                        }
+                    }
+                    update_tray_menu_labels(app);
+                }
+                let _ = app.emit("toggle-stats", ());
+            }
+            "quit" => app.exit(0),
+            _ => {}
         })
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {
@@ -572,16 +844,27 @@ pub fn run() {
         .setup(|app| {
             app.manage(ListenerStarted(AtomicBool::new(false)));
             app.manage(WindowVisible(AtomicBool::new(true)));
-            app.manage(WindowPinned(AtomicBool::new(true)));
+            app.manage(WindowPinned(AtomicBool::new(false)));
             setup_tray(app)?;
+            update_tray_menu_labels(app.app_handle());
 
             // Workaround: transparent windows can disappear when dragged to a
             // display with a different backing scale factor (macOS WebKit bug).
             // A debounced 1px resize after move forces a redraw.
             if let Some(window) = app.get_webview_window("main") {
+                #[cfg(target_os = "windows")]
+                {
+                    win_desktop_host::apply(app.app_handle());
+                }
+
+                #[cfg(not(target_os = "windows"))]
                 let w = window.clone();
+                #[cfg(target_os = "windows")]
+                let app_handle = app.app_handle().clone();
+                #[cfg(not(target_os = "windows"))]
                 let pending = Arc::new(AtomicBool::new(false));
                 window.on_window_event(move |event| {
+                    #[cfg(not(target_os = "windows"))]
                     if let tauri::WindowEvent::Moved(_) = event {
                         if !pending.swap(true, Ordering::SeqCst) {
                             let w = w.clone();
@@ -599,11 +882,24 @@ pub fn run() {
                             });
                         }
                     }
+
+                    #[cfg(target_os = "windows")]
+                    if matches!(
+                        event,
+                        tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)
+                    ) {
+                        win_desktop_host::schedule_apply(
+                            &app_handle,
+                            std::time::Duration::from_millis(100),
+                        );
+                    }
                 });
             }
 
             let shortcut = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyK);
-            app.global_shortcut().register(shortcut)?;
+            if let Err(err) = app.global_shortcut().register(shortcut) {
+                eprintln!("Failed to register global shortcut Super+Shift+K: {err}");
+            }
 
             Ok(())
         })
